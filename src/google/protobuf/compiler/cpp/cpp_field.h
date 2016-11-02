@@ -69,7 +69,7 @@ void SetCommonOneofFieldVariables(const FieldDescriptor* descriptor,
 
 class FieldGenerator {
  public:
-  FieldGenerator() {}
+  explicit FieldGenerator(const Options& options) : options_(options) {}
   virtual ~FieldGenerator();
 
   // Generate lines of code declaring members fields of the message class
@@ -82,14 +82,40 @@ class FieldGenerator {
   // implementation is empty.
   virtual void GenerateStaticMembers(io::Printer* /*printer*/) const {}
 
+  // Generate prototypes for accessors that will manipulate imported
+  // messages inline.  These are for .proto.h headers.
+  //
+  // In .proto.h mode, the headers of imports are not #included. However,
+  // functions that manipulate the imported message types need access to
+  // the class definition of the imported message, meaning that the headers
+  // must be #included. To get around this, functions that manipulate
+  // imported message objects are defined as dependent functions in a base
+  // template class. By making them dependent template functions, the
+  // function templates will not be instantiated until they are called, so
+  // we can defer to those translation units to #include the necessary
+  // generated headers.
+  //
+  // See:
+  // http://en.cppreference.com/w/cpp/language/class_template#Implicit_instantiation
+  //
+  // Most field types don't need this, so the default implementation is empty.
+  virtual void GenerateDependentAccessorDeclarations(
+      io::Printer* printer) const {}
+
   // Generate prototypes for all of the accessor functions related to this
   // field.  These are placed inside the class definition.
   virtual void GenerateAccessorDeclarations(io::Printer* printer) const = 0;
 
+  // Generate inline definitions of depenent accessor functions for this field.
+  // These are placed inside the header after all class definitions.
+  virtual void GenerateDependentInlineAccessorDefinitions(
+    io::Printer* printer) const {}
+
   // Generate inline definitions of accessor functions for this field.
   // These are placed inside the header after all class definitions.
+  // In non-.proto.h mode, this generates dependent accessor functions as well.
   virtual void GenerateInlineAccessorDefinitions(
-    io::Printer* printer) const = 0;
+    io::Printer* printer, bool is_inline) const = 0;
 
   // Generate definitions of accessors that aren't inlined.  These are
   // placed somewhere in the .cc file.
@@ -109,6 +135,13 @@ class FieldGenerator {
   // Details of this usage can be found in message.cc under the
   // GenerateMergeFrom method.
   virtual void GenerateMergingCode(io::Printer* printer) const = 0;
+
+  // The same, but the generated code may or may not check the possibility that
+  // the two objects being merged have the same address.  To be safe, callers
+  // should avoid calling this unless they know the objects are different.
+  virtual void GenerateUnsafeMergingCode(io::Printer* printer) const {
+    GenerateMergingCode(printer);
+  }
 
   // Generate lines of code (statements, not declarations) which swaps
   // this field and the corresponding field of another message, which
@@ -168,6 +201,9 @@ class FieldGenerator {
   // are placed in the message's ByteSize() method.
   virtual void GenerateByteSize(io::Printer* printer) const = 0;
 
+ protected:
+  const Options& options_;
+
  private:
   GOOGLE_DISALLOW_EVIL_CONSTRUCTORS(FieldGenerator);
 };
@@ -175,13 +211,14 @@ class FieldGenerator {
 // Convenience class which constructs FieldGenerators for a Descriptor.
 class FieldGeneratorMap {
  public:
-  explicit FieldGeneratorMap(const Descriptor* descriptor, const Options& options);
+  FieldGeneratorMap(const Descriptor* descriptor, const Options& options);
   ~FieldGeneratorMap();
 
   const FieldGenerator& get(const FieldDescriptor* field) const;
 
  private:
   const Descriptor* descriptor_;
+  const Options& options_;
   google::protobuf::scoped_array<google::protobuf::scoped_ptr<FieldGenerator> > field_generators_;
 
   static FieldGenerator* MakeGenerator(const FieldDescriptor* field,

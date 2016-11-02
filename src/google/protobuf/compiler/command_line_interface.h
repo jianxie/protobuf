@@ -39,6 +39,7 @@
 #define GOOGLE_PROTOBUF_COMPILER_COMMAND_LINE_INTERFACE_H__
 
 #include <google/protobuf/stubs/common.h>
+#include <google/protobuf/stubs/hash.h>
 #include <string>
 #include <vector>
 #include <map>
@@ -54,6 +55,11 @@ class FileDescriptor;        // descriptor.h
 class FileDescriptorProto;   // descriptor.pb.h
 template<typename T> class RepeatedPtrField;  // repeated_field.h
 
+}  // namespace protobuf
+}  // namespace google
+
+namespace google {
+namespace protobuf {
 namespace compiler {
 
 class CodeGenerator;        // code_generator.h
@@ -140,14 +146,14 @@ class LIBPROTOC_EXPORT CommandLineInterface {
   //   plugin [--out=OUTDIR] [--parameter=PARAMETER] PROTO_FILES < DESCRIPTORS
   // --out indicates the output directory (as passed to the --foo_out
   // parameter); if omitted, the current directory should be used.  --parameter
-  // gives the generator parameter, if any was provided.  The PROTO_FILES list
-  // the .proto files which were given on the compiler command-line; these are
-  // the files for which the plugin is expected to generate output code.
-  // Finally, DESCRIPTORS is an encoded FileDescriptorSet (as defined in
-  // descriptor.proto).  This is piped to the plugin's stdin.  The set will
-  // include descriptors for all the files listed in PROTO_FILES as well as
-  // all files that they import.  The plugin MUST NOT attempt to read the
-  // PROTO_FILES directly -- it must use the FileDescriptorSet.
+  // gives the generator parameter, if any was provided (see below).  The
+  // PROTO_FILES list the .proto files which were given on the compiler
+  // command-line; these are the files for which the plugin is expected to
+  // generate output code.  Finally, DESCRIPTORS is an encoded FileDescriptorSet
+  // (as defined in descriptor.proto).  This is piped to the plugin's stdin.
+  // The set will include descriptors for all the files listed in PROTO_FILES as
+  // well as all files that they import.  The plugin MUST NOT attempt to read
+  // the PROTO_FILES directly -- it must use the FileDescriptorSet.
   //
   // The plugin should generate whatever files are necessary, as code generators
   // normally do.  It should write the names of all files it generates to
@@ -155,6 +161,13 @@ class LIBPROTOC_EXPORT CommandLineInterface {
   // names or relative to the current directory.  If any errors occur, error
   // messages should be written to stderr.  If an error is fatal, the plugin
   // should exit with a non-zero exit code.
+  //
+  // Plugins can have generator parameters similar to normal built-in
+  // generators. Extra generator parameters can be passed in via a matching
+  // "_opt" parameter. For example:
+  //   protoc --plug_out=enable_bar:outdir --plug_opt=enable_baz
+  // This will pass "enable_bar,enable_baz" as the parameter to the plugin.
+  //
   void AllowPlugins(const string& exe_name_prefix);
 
   // Run the Protocol Compiler with the given command-line parameters.
@@ -190,6 +203,7 @@ class LIBPROTOC_EXPORT CommandLineInterface {
   class ErrorPrinter;
   class GeneratorContextImpl;
   class MemoryOutputStream;
+  typedef hash_map<string, GeneratorContextImpl*> GeneratorContextMap;
 
   // Clear state from previous Run().
   void Clear();
@@ -209,6 +223,7 @@ class LIBPROTOC_EXPORT CommandLineInterface {
 
   // Parse all command-line arguments.
   ParseArgumentStatus ParseArguments(int argc, const char* const argv[]);
+
 
   // Parses a command-line argument into a name/value pair.  Returns
   // true if the next argument in the argv should be used as the value,
@@ -247,6 +262,12 @@ class LIBPROTOC_EXPORT CommandLineInterface {
   // Implements the --descriptor_set_out option.
   bool WriteDescriptorSet(const vector<const FileDescriptor*> parsed_files);
 
+  // Implements the --dependency_out option
+  bool GenerateDependencyManifestFile(
+      const vector<const FileDescriptor*>& parsed_files,
+      const GeneratorContextMap& output_directories,
+      DiskSourceTree* source_tree);
+
   // Get all transitive dependencies of the given file (including the file
   // itself), adding them to the given list of FileDescriptorProtos.  The
   // protos will be ordered such that every file is listed before any file that
@@ -254,8 +275,11 @@ class LIBPROTOC_EXPORT CommandLineInterface {
   // in order.  Any files in *already_seen will not be added, and each file
   // added will be inserted into *already_seen.  If include_source_code_info is
   // true then include the source code information in the FileDescriptorProtos.
+  // If include_json_name is true, populate the json_name field of
+  // FieldDescriptorProto for all fields.
   static void GetTransitiveDependencies(
       const FileDescriptor* file,
+      bool include_json_name,
       bool include_source_code_info,
       set<const FileDescriptor*>* already_seen,
       RepeatedPtrField<FileDescriptorProto>* output);
@@ -299,6 +323,8 @@ class LIBPROTOC_EXPORT CommandLineInterface {
   //   protoc --foo_out=outputdir --foo_opt=enable_bar ...
   // Then there will be an entry ("--foo_out", "enable_bar") in this map.
   map<string, string> generator_parameters_;
+  // Similar to generator_parameters_, but stores the parameters for plugins.
+  map<string, string> plugin_parameters_;
 
   // See AllowPlugins().  If this is empty, plugins aren't allowed.
   string plugin_prefix_;
@@ -335,6 +361,11 @@ class LIBPROTOC_EXPORT CommandLineInterface {
   vector<pair<string, string> > proto_path_;  // Search path for proto files.
   vector<string> input_files_;                // Names of the input proto files.
 
+  // Names of proto files which are allowed to be imported. Used by build
+  // systems to enforce depend-on-what-you-import.
+  set<string> direct_dependencies_;
+  bool direct_dependencies_explicitly_set_;
+
   // output_directives_ lists all the files we are supposed to output and what
   // generator to use for each.
   struct OutputDirective {
@@ -352,6 +383,10 @@ class LIBPROTOC_EXPORT CommandLineInterface {
   // If --descriptor_set_out was given, this is the filename to which the
   // FileDescriptorSet should be written.  Otherwise, empty.
   string descriptor_set_name_;
+
+  // If --dependency_out was given, this is the path to the file where the
+  // dependency file will be written. Otherwise, empty.
+  string dependency_out_name_;
 
   // True if --include_imports was given, meaning that we should
   // write all transitive dependencies to the DescriptorSet.  Otherwise, only

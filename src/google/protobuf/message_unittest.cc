@@ -45,14 +45,17 @@
 #include <sstream>
 #include <fstream>
 
-#include <google/protobuf/io/zero_copy_stream_impl.h>
-#include <google/protobuf/io/coded_stream.h>
-#include <google/protobuf/descriptor.h>
-#include <google/protobuf/descriptor.pb.h>
-#include <google/protobuf/unittest.pb.h>
 #include <google/protobuf/test_util.h>
+#include <google/protobuf/unittest.pb.h>
+#include <google/protobuf/io/coded_stream.h>
+#include <google/protobuf/io/zero_copy_stream_impl.h>
+#include <google/protobuf/descriptor.pb.h>
+#include <google/protobuf/descriptor.h>
+#include <google/protobuf/generated_message_reflection.h>
 
+#include <google/protobuf/stubs/logging.h>
 #include <google/protobuf/stubs/common.h>
+#include <google/protobuf/stubs/logging.h>
 #include <google/protobuf/testing/googletest.h>
 #include <gtest/gtest.h>
 
@@ -205,6 +208,28 @@ TEST(MessageTest, InitializationErrorString) {
   EXPECT_EQ("a, b, c", message.InitializationErrorString());
 }
 
+TEST(MessageTest, DynamicCastToGenerated) {
+  unittest::TestAllTypes test_all_types;
+
+  google::protobuf::Message* test_all_types_pointer = &test_all_types;
+  EXPECT_EQ(&test_all_types,
+            google::protobuf::internal::DynamicCastToGenerated<unittest::TestAllTypes>(
+                test_all_types_pointer));
+  EXPECT_EQ(NULL,
+            google::protobuf::internal::DynamicCastToGenerated<unittest::TestRequired>(
+                test_all_types_pointer));
+
+  const google::protobuf::Message* test_all_types_pointer_const = &test_all_types;
+  EXPECT_EQ(
+      &test_all_types,
+      google::protobuf::internal::DynamicCastToGenerated<const unittest::TestAllTypes>(
+          test_all_types_pointer_const));
+  EXPECT_EQ(
+      NULL,
+      google::protobuf::internal::DynamicCastToGenerated<const unittest::TestRequired>(
+          test_all_types_pointer_const));
+}
+
 #ifdef PROTOBUF_HAS_DEATH_TEST  // death tests do not work on Windows yet.
 
 TEST(MessageTest, SerializeFailsIfNotInitialized) {
@@ -240,6 +265,24 @@ TEST(MessageTest, CheckOverflow) {
   EXPECT_FALSE(message.AppendToCord(&serialized));
 }
 
+TEST(MessageTest, CheckBigOverflow) {
+  unittest::TestAllTypes message;
+  // Create a message with size just over 4GB. We should be able to detect this
+  // too, even though it will make a plain "int" wrap back to a positive number.
+  const string data(1024, 'x');
+  Cord one_megabyte;
+  for (int i = 0; i < 1024; i++) {
+    one_megabyte.Append(data);
+  }
+
+  for (int i = 0; i < 4 * 1024 + 1; ++i) {
+    message.add_repeated_cord()->CopyFrom(one_megabyte);
+  }
+
+  Cord serialized;
+  EXPECT_FALSE(message.AppendToCord(&serialized));
+}
+
 #endif  // PROTOBUF_HAS_DEATH_TEST
 
 namespace {
@@ -247,6 +290,12 @@ namespace {
 class NegativeByteSize : public unittest::TestRequired {
  public:
   virtual int ByteSize() const { return -1; }
+
+  // The implementation of ByteSizeLong() from MessageLite, to simulate what
+  // would happen if TestRequired *hadn't* overridden it already.
+  virtual size_t ByteSizeLong() const {
+    return static_cast<unsigned int>(ByteSize());
+  }
 };
 
 }  // namespace
@@ -292,6 +341,18 @@ TEST(MessageTest, ParseFailsOnInvalidMessageEnd) {
 
   // The byte is an endgroup tag, but we aren't parsing a group.
   EXPECT_FALSE(message.ParseFromArray("\014", 1));
+}
+
+// Regression test for b/23630858
+TEST(MessageTest, MessageIsStillValidAfterParseFails) {
+  unittest::TestAllTypes message;
+
+  // 9 0xFFs for the "optional_uint64" field.
+  string invalid_data = "\x20\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF";
+
+  EXPECT_FALSE(message.ParseFromString(invalid_data));
+  message.Clear();
+  EXPECT_EQ(0, message.optional_uint64());
 }
 
 namespace {

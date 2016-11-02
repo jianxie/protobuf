@@ -34,6 +34,10 @@
 
 #include <google/protobuf/stubs/hash.h>
 #include <map>
+#include <memory>
+#ifndef _SHARED_PTR_H
+#include <google/protobuf/stubs/shared_ptr.h>
+#endif
 #include <set>
 #include <string>
 #include <vector>
@@ -53,6 +57,8 @@
 #include <google/protobuf/io/tokenizer.h>
 #include <google/protobuf/io/zero_copy_stream_impl.h>
 #include <google/protobuf/stubs/common.h>
+#include <google/protobuf/stubs/logging.h>
+#include <google/protobuf/stubs/mutex.h>
 #include <google/protobuf/stubs/once.h>
 #include <google/protobuf/stubs/stringprintf.h>
 #include <google/protobuf/stubs/strutil.h>
@@ -63,6 +69,7 @@
 #undef PACKAGE  // autoheader #defines this.  :(
 
 namespace google {
+
 namespace protobuf {
 
 const FieldDescriptor::CppType
@@ -150,13 +157,22 @@ const char* FileDescriptor::SyntaxName(FileDescriptor::Syntax syntax) {
 
 static const char * const kNonLinkedWeakMessageReplacementName = "google.protobuf.Empty";
 
-#ifndef _MSC_VER  // MSVC doesn't need these and won't even accept them.
+#if !defined(_MSC_VER) || _MSC_VER >= 1900
 const int FieldDescriptor::kMaxNumber;
 const int FieldDescriptor::kFirstReservedNumber;
 const int FieldDescriptor::kLastReservedNumber;
 #endif
 
 namespace {
+
+// Note:  I distrust ctype.h due to locales.
+char ToUpper(char ch) {
+  return (ch >= 'a' && ch <= 'z') ? (ch - 'a' + 'A') : ch;
+}
+
+char ToLower(char ch) {
+  return (ch >= 'A' && ch <= 'Z') ? (ch - 'A' + 'a') : ch;
+}
 
 string ToCamelCase(const string& input, bool lower_first) {
   bool capitalize_next = !lower_first;
@@ -167,12 +183,7 @@ string ToCamelCase(const string& input, bool lower_first) {
     if (input[i] == '_') {
       capitalize_next = true;
     } else if (capitalize_next) {
-      // Note:  I distrust ctype.h due to locales.
-      if ('a' <= input[i] && input[i] <= 'z') {
-        result.push_back(input[i] - 'a' + 'A');
-      } else {
-        result.push_back(input[i]);
-      }
+      result.push_back(ToUpper(input[i]));
       capitalize_next = false;
     } else {
       result.push_back(input[i]);
@@ -180,12 +191,115 @@ string ToCamelCase(const string& input, bool lower_first) {
   }
 
   // Lower-case the first letter.
-  if (lower_first && !result.empty() && 'A' <= result[0] && result[0] <= 'Z') {
-      result[0] = result[0] - 'A' + 'a';
+  if (lower_first && !result.empty()) {
+    result[0] = ToLower(result[0]);
   }
 
   return result;
 }
+
+string ToJsonName(const string& input) {
+  bool capitalize_next = false;
+  string result;
+  result.reserve(input.size());
+
+  for (int i = 0; i < input.size(); i++) {
+    if (input[i] == '_') {
+      capitalize_next = true;
+    } else if (capitalize_next) {
+      result.push_back(ToUpper(input[i]));
+      capitalize_next = false;
+    } else {
+      result.push_back(input[i]);
+    }
+  }
+
+  return result;
+}
+
+string EnumValueToPascalCase(const string& input) {
+  bool next_upper = true;
+  string result;
+  result.reserve(input.size());
+
+  for (int i = 0; i < input.size(); i++) {
+    if (input[i] == '_') {
+      next_upper = true;
+    } else {
+      if (next_upper) {
+        result.push_back(ToUpper(input[i]));
+      } else {
+        result.push_back(ToLower(input[i]));
+      }
+      next_upper = false;
+    }
+  }
+
+  return result;
+}
+
+// Class to remove an enum prefix from enum values.
+class PrefixRemover {
+ public:
+  PrefixRemover(StringPiece prefix) {
+    // Strip underscores and lower-case the prefix.
+    for (int i = 0; i < prefix.size(); i++) {
+      if (prefix[i] != '_') {
+        prefix_ += ascii_tolower(prefix[i]);
+      }
+    }
+  }
+
+  // Tries to remove the enum prefix from this enum value.
+  // If this is not possible, returns the input verbatim.
+  string MaybeRemove(StringPiece str) {
+    // We can't just lowercase and strip str and look for a prefix.
+    // We need to properly recognize the difference between:
+    //
+    //   enum Foo {
+    //     FOO_BAR_BAZ = 0;
+    //     FOO_BARBAZ = 1;
+    //   }
+    //
+    // This is acceptable (though perhaps not advisable) because even when
+    // we PascalCase, these two will still be distinct (BarBaz vs. Barbaz).
+    size_t i, j;
+
+    // Skip past prefix_ in str if we can.
+    for (i = 0, j = 0; i < str.size() && j < prefix_.size(); i++) {
+      if (str[i] == '_') {
+        continue;
+      }
+
+      if (ascii_tolower(str[i]) != prefix_[j++]) {
+        return str.as_string();
+      }
+    }
+
+    // If we didn't make it through the prefix, we've failed to strip the
+    // prefix.
+    if (j < prefix_.size()) {
+      return str.as_string();
+    }
+
+    // Skip underscores between prefix and further characters.
+    while (i < str.size() && str[i] == '_') {
+      i++;
+    }
+
+    // Enum label can't be the empty string.
+    if (i == str.size()) {
+      return str.as_string();
+    }
+
+    // We successfully stripped the prefix.
+    str.remove_prefix(i);
+    return str.as_string();
+  }
+
+ private:
+  string prefix_;
+};
 
 // A DescriptorPool contains a bunch of hash_maps to implement the
 // various Find*By*() methods.  Since hashtable lookups are O(1), it's
@@ -351,13 +465,20 @@ void DeleteAllowedProto3Extendee() {
 
 void InitAllowedProto3Extendee() {
   allowed_proto3_extendees_ = new set<string>;
-  allowed_proto3_extendees_->insert("google.protobuf.FileOptions");
-  allowed_proto3_extendees_->insert("google.protobuf.MessageOptions");
-  allowed_proto3_extendees_->insert("google.protobuf.FieldOptions");
-  allowed_proto3_extendees_->insert("google.protobuf.EnumOptions");
-  allowed_proto3_extendees_->insert("google.protobuf.EnumValueOptions");
-  allowed_proto3_extendees_->insert("google.protobuf.ServiceOptions");
-  allowed_proto3_extendees_->insert("google.protobuf.MethodOptions");
+  const char* kOptionNames[] = {
+      "FileOptions",      "MessageOptions", "FieldOptions", "EnumOptions",
+      "EnumValueOptions", "ServiceOptions", "MethodOptions"};
+  for (int i = 0; i < GOOGLE_ARRAYSIZE(kOptionNames); ++i) {
+    // descriptor.proto has a different package name in opensource. We allow
+    // both so the opensource protocol compiler can also compile internal
+    // proto3 files with custom options. See: b/27567912
+    allowed_proto3_extendees_->insert(string("google.protobuf.") +
+                                      kOptionNames[i]);
+    // Split the word to trick the opensource processing scripts so they
+    // will keep the origial package name.
+    allowed_proto3_extendees_->insert(string("proto") + "2." + kOptionNames[i]);
+  }
+
   google::protobuf::internal::OnShutdown(&DeleteAllowedProto3Extendee);
 }
 
@@ -554,7 +675,7 @@ class FileDescriptorTables {
   ~FileDescriptorTables();
 
   // Empty table, used with placeholder files.
-  static const FileDescriptorTables kEmpty;
+  inline static const FileDescriptorTables& GetEmptyInstance();
 
   // -----------------------------------------------------------------
   // Finding items.
@@ -659,7 +780,32 @@ FileDescriptorTables::FileDescriptorTables()
 
 FileDescriptorTables::~FileDescriptorTables() {}
 
-const FileDescriptorTables FileDescriptorTables::kEmpty;
+namespace {
+
+FileDescriptorTables* file_descriptor_tables_ = NULL;
+GOOGLE_PROTOBUF_DECLARE_ONCE(file_descriptor_tables_once_init_);
+
+void DeleteFileDescriptorTables() {
+  delete file_descriptor_tables_;
+  file_descriptor_tables_ = NULL;
+}
+
+void InitFileDescriptorTables() {
+  file_descriptor_tables_ = new FileDescriptorTables();
+  internal::OnShutdown(&DeleteFileDescriptorTables);
+}
+
+inline void InitFileDescriptorTablesOnce() {
+  ::google::protobuf::GoogleOnceInit(
+      &file_descriptor_tables_once_init_, &InitFileDescriptorTables);
+}
+
+}  // anonymous namespace
+
+inline const FileDescriptorTables& FileDescriptorTables::GetEmptyInstance() {
+  InitFileDescriptorTablesOnce();
+  return *file_descriptor_tables_;
+}
 
 void DescriptorPool::Tables::AddCheckpoint() {
   checkpoints_.push_back(CheckPoint(this));
@@ -783,7 +929,7 @@ inline const FileDescriptor* DescriptorPool::Tables::FindFile(
 
 inline const FieldDescriptor* FileDescriptorTables::FindFieldByNumber(
     const Descriptor* parent, int number) const {
-  return FindPtrOrNull(fields_by_number_, make_pair(parent, number));
+  return FindPtrOrNull(fields_by_number_, std::make_pair(parent, number));
 }
 
 inline const FieldDescriptor* FileDescriptorTables::FindFieldByLowercaseName(
@@ -800,7 +946,7 @@ inline const FieldDescriptor* FileDescriptorTables::FindFieldByCamelcaseName(
 
 inline const EnumValueDescriptor* FileDescriptorTables::FindEnumValueByNumber(
     const EnumDescriptor* parent, int number) const {
-  return FindPtrOrNull(enum_values_by_number_, make_pair(parent, number));
+  return FindPtrOrNull(enum_values_by_number_, std::make_pair(parent, number));
 }
 
 inline const EnumValueDescriptor*
@@ -808,8 +954,8 @@ FileDescriptorTables::FindEnumValueByNumberCreatingIfUnknown(
     const EnumDescriptor* parent, int number) const {
   // First try, with map of compiled-in values.
   {
-    const EnumValueDescriptor* desc = FindPtrOrNull(
-        enum_values_by_number_, make_pair(parent, number));
+    const EnumValueDescriptor* desc =
+        FindPtrOrNull(enum_values_by_number_, std::make_pair(parent, number));
     if (desc != NULL) {
       return desc;
     }
@@ -818,7 +964,7 @@ FileDescriptorTables::FindEnumValueByNumberCreatingIfUnknown(
   {
     ReaderMutexLock l(&unknown_enum_values_mu_);
     const EnumValueDescriptor* desc = FindPtrOrNull(
-        unknown_enum_values_by_number_, make_pair(parent, number));
+        unknown_enum_values_by_number_, std::make_pair(parent, number));
     if (desc != NULL) {
       return desc;
     }
@@ -828,7 +974,7 @@ FileDescriptorTables::FindEnumValueByNumberCreatingIfUnknown(
   {
     WriterMutexLock l(&unknown_enum_values_mu_);
     const EnumValueDescriptor* desc = FindPtrOrNull(
-        unknown_enum_values_by_number_, make_pair(parent, number));
+        unknown_enum_values_by_number_, std::make_pair(parent, number));
     if (desc != NULL) {
       return desc;
     }
@@ -850,8 +996,7 @@ FileDescriptorTables::FindEnumValueByNumberCreatingIfUnknown(
     result->type_ = parent;
     result->options_ = &EnumValueOptions::default_instance();
     InsertIfNotPresent(&unknown_enum_values_by_number_,
-                       make_pair(parent, number),
-                       result);
+                       std::make_pair(parent, number), result);
     return result;
   }
 }
@@ -859,13 +1004,13 @@ FileDescriptorTables::FindEnumValueByNumberCreatingIfUnknown(
 
 inline const FieldDescriptor* DescriptorPool::Tables::FindExtension(
     const Descriptor* extendee, int number) {
-  return FindPtrOrNull(extensions_, make_pair(extendee, number));
+  return FindPtrOrNull(extensions_, std::make_pair(extendee, number));
 }
 
 inline void DescriptorPool::Tables::FindAllExtensions(
     const Descriptor* extendee, vector<const FieldDescriptor*>* out) const {
   ExtensionsGroupedByDescriptorMap::const_iterator it =
-      extensions_.lower_bound(make_pair(extendee, 0));
+      extensions_.lower_bound(std::make_pair(extendee, 0));
   for (; it != extensions_.end() && it->first.first == extendee; ++it) {
     out->push_back(it->second);
   }
@@ -993,7 +1138,7 @@ void FileDescriptorTables::BuildLocationsByPath(
 const SourceCodeInfo_Location* FileDescriptorTables::GetSourceLocation(
     const vector<int>& path, const SourceCodeInfo* info) const {
   pair<const FileDescriptorTables*, const SourceCodeInfo*> p(
-      make_pair(this, info));
+      std::make_pair(this, info));
   locations_by_path_once_.Init(&FileDescriptorTables::BuildLocationsByPath, &p);
   return FindPtrOrNull(locations_by_path_, Join(path, ","));
 }
@@ -1092,6 +1237,7 @@ const DescriptorPool* DescriptorPool::generated_pool() {
   InitGeneratedPoolOnce();
   return generated_pool_;
 }
+
 
 DescriptorPool* DescriptorPool::internal_generated_pool() {
   InitGeneratedPoolOnce();
@@ -1519,6 +1665,18 @@ Descriptor::FindExtensionRangeContainingNumber(int number) const {
   return NULL;
 }
 
+const Descriptor::ReservedRange*
+Descriptor::FindReservedRangeContainingNumber(int number) const {
+  // TODO(chrisn): Consider a non-linear search.
+  for (int i = 0; i < reserved_range_count(); i++) {
+    if (number >= reserved_range(i)->start &&
+        number <  reserved_range(i)->end) {
+      return reserved_range(i);
+    }
+  }
+  return NULL;
+}
+
 // -------------------------------------------------------------------
 
 bool DescriptorPool::TryFindFileInFallbackDatabase(const string& name) const {
@@ -1712,6 +1870,20 @@ void FileDescriptor::CopyTo(FileDescriptorProto* proto) const {
   }
 }
 
+void FileDescriptor::CopyJsonNameTo(FileDescriptorProto* proto) const {
+  if (message_type_count() != proto->message_type_size() ||
+      extension_count() != proto->extension_size()) {
+    GOOGLE_LOG(ERROR) << "Cannot copy json_name to a proto of a different size.";
+    return;
+  }
+  for (int i = 0; i < message_type_count(); i++) {
+    message_type(i)->CopyJsonNameTo(proto->mutable_message_type(i));
+  }
+  for (int i = 0; i < extension_count(); i++) {
+    extension(i)->CopyJsonNameTo(proto->mutable_extension(i));
+  }
+}
+
 void FileDescriptor::CopySourceCodeInfoTo(FileDescriptorProto* proto) const {
   if (source_code_info_ &&
       source_code_info_ != &SourceCodeInfo::default_instance()) {
@@ -1742,15 +1914,44 @@ void Descriptor::CopyTo(DescriptorProto* proto) const {
   for (int i = 0; i < extension_count(); i++) {
     extension(i)->CopyTo(proto->add_extension());
   }
+  for (int i = 0; i < reserved_range_count(); i++) {
+    DescriptorProto::ReservedRange* range = proto->add_reserved_range();
+    range->set_start(reserved_range(i)->start);
+    range->set_end(reserved_range(i)->end);
+  }
+  for (int i = 0; i < reserved_name_count(); i++) {
+    proto->add_reserved_name(reserved_name(i));
+  }
 
   if (&options() != &MessageOptions::default_instance()) {
     proto->mutable_options()->CopyFrom(options());
   }
 }
 
+void Descriptor::CopyJsonNameTo(DescriptorProto* proto) const {
+  if (field_count() != proto->field_size() ||
+      nested_type_count() != proto->nested_type_size() ||
+      extension_count() != proto->extension_size()) {
+    GOOGLE_LOG(ERROR) << "Cannot copy json_name to a proto of a different size.";
+    return;
+  }
+  for (int i = 0; i < field_count(); i++) {
+    field(i)->CopyJsonNameTo(proto->mutable_field(i));
+  }
+  for (int i = 0; i < nested_type_count(); i++) {
+    nested_type(i)->CopyJsonNameTo(proto->mutable_nested_type(i));
+  }
+  for (int i = 0; i < extension_count(); i++) {
+    extension(i)->CopyJsonNameTo(proto->mutable_extension(i));
+  }
+}
+
 void FieldDescriptor::CopyTo(FieldDescriptorProto* proto) const {
   proto->set_name(name());
   proto->set_number(number());
+  if (has_json_name_) {
+    proto->set_json_name(json_name());
+  }
 
   // Some compilers do not allow static_cast directly between two enum types,
   // so we must cast to int first.
@@ -1797,8 +1998,15 @@ void FieldDescriptor::CopyTo(FieldDescriptorProto* proto) const {
   }
 }
 
+void FieldDescriptor::CopyJsonNameTo(FieldDescriptorProto* proto) const {
+  proto->set_json_name(json_name());
+}
+
 void OneofDescriptor::CopyTo(OneofDescriptorProto* proto) const {
   proto->set_name(name());
+  if (&options() != &OneofOptions::default_instance()) {
+    proto->mutable_options()->CopyFrom(options());
+  }
 }
 
 void EnumDescriptor::CopyTo(EnumDescriptorProto* proto) const {
@@ -1929,9 +2137,9 @@ bool FormatLineOptions(int depth, const Message &options, string *output) {
   return !all_options.empty();
 }
 
-template<typename DescType>
 class SourceLocationCommentPrinter {
  public:
+  template<typename DescType>
   SourceLocationCommentPrinter(const DescType* desc,
                                const string& prefix,
                                const DebugStringOptions& options)
@@ -1941,9 +2149,27 @@ class SourceLocationCommentPrinter {
     have_source_loc_ = options.include_comments &&
         desc->GetSourceLocation(&source_loc_);
   }
+  SourceLocationCommentPrinter(const FileDescriptor* file,
+                               const vector<int>& path,
+                               const string& prefix,
+                               const DebugStringOptions& options)
+      : options_(options), prefix_(prefix) {
+    // Perform the SourceLocation lookup only if we're including user comments,
+    // because the lookup is fairly expensive.
+    have_source_loc_ = options.include_comments &&
+        file->GetSourceLocation(path, &source_loc_);
+  }
   void AddPreComment(string* output) {
-    if (have_source_loc_ && source_loc_.leading_comments.size() > 0) {
-      *output += FormatComment(source_loc_.leading_comments);
+    if (have_source_loc_) {
+      // Detached leading comments.
+      for (int i = 0 ; i < source_loc_.leading_detached_comments.size(); ++i) {
+        *output += FormatComment(source_loc_.leading_detached_comments[i]);
+        *output += "\n";
+      }
+      // Attached leading comments.
+      if (!source_loc_.leading_comments.empty()) {
+        *output += FormatComment(source_loc_.leading_comments);
+      }
     }
   }
   void AddPostComment(string* output) {
@@ -1967,7 +2193,7 @@ class SourceLocationCommentPrinter {
   }
 
  private:
-  const DescType* desc_;
+
   bool have_source_loc_;
   SourceLocation source_loc_;
   DebugStringOptions options_;
@@ -1984,10 +2210,18 @@ string FileDescriptor::DebugString() const {
 string FileDescriptor::DebugStringWithOptions(
     const DebugStringOptions& debug_string_options) const {
   string contents;
-  strings::SubstituteAndAppend(&contents, "syntax = \"$0\";\n\n",
-                               SyntaxName(syntax()));
+  {
+    vector<int> path;
+    path.push_back(FileDescriptorProto::kSyntaxFieldNumber);
+    SourceLocationCommentPrinter syntax_comment(
+        this, path, "", debug_string_options);
+    syntax_comment.AddPreComment(&contents);
+    strings::SubstituteAndAppend(&contents, "syntax = \"$0\";\n\n",
+                                 SyntaxName(syntax()));
+    syntax_comment.AddPostComment(&contents);
+  }
 
-  SourceLocationCommentPrinter<FileDescriptor>
+  SourceLocationCommentPrinter
       comment_printer(this, "", debug_string_options);
   comment_printer.AddPreComment(&contents);
 
@@ -2012,7 +2246,13 @@ string FileDescriptor::DebugStringWithOptions(
   }
 
   if (!package().empty()) {
+    vector<int> path;
+    path.push_back(FileDescriptorProto::kPackageFieldNumber);
+    SourceLocationCommentPrinter package_comment(
+        this, path, "", debug_string_options);
+    package_comment.AddPreComment(&contents);
     strings::SubstituteAndAppend(&contents, "package $0;\n\n", package());
+    package_comment.AddPostComment(&contents);
   }
 
   if (FormatLineOptions(0, options(), &contents)) {
@@ -2087,7 +2327,7 @@ void Descriptor::DebugString(int depth, string *contents,
   string prefix(depth * 2, ' ');
   ++depth;
 
-  SourceLocationCommentPrinter<Descriptor>
+  SourceLocationCommentPrinter
       comment_printer(this, prefix, debug_string_options);
   comment_printer.AddPreComment(contents);
 
@@ -2156,6 +2396,29 @@ void Descriptor::DebugString(int depth, string *contents,
   if (extension_count() > 0)
     strings::SubstituteAndAppend(contents, "$0  }\n", prefix);
 
+  if (reserved_range_count() > 0) {
+    strings::SubstituteAndAppend(contents, "$0  reserved ", prefix);
+    for (int i = 0; i < reserved_range_count(); i++) {
+      const Descriptor::ReservedRange* range = reserved_range(i);
+      if (range->end == range->start + 1) {
+        strings::SubstituteAndAppend(contents, "$0, ", range->start);
+      } else {
+        strings::SubstituteAndAppend(contents, "$0 to $1, ",
+                                     range->start, range->end - 1);
+      }
+    }
+    contents->replace(contents->size() - 2, 2, ";\n");
+  }
+
+  if (reserved_name_count() > 0) {
+    strings::SubstituteAndAppend(contents, "$0  reserved ", prefix);
+    for (int i = 0; i < reserved_name_count(); i++) {
+      strings::SubstituteAndAppend(contents, "\"$0\", ",
+                                   CEscape(reserved_name(i)));
+    }
+    contents->replace(contents->size() - 2, 2, ";\n");
+  }
+
   strings::SubstituteAndAppend(contents, "$0}\n", prefix);
   comment_printer.AddPostComment(contents);
 }
@@ -2217,7 +2480,7 @@ void FieldDescriptor::DebugString(int depth,
     label.push_back(' ');
   }
 
-  SourceLocationCommentPrinter<FieldDescriptor>
+  SourceLocationCommentPrinter
       comment_printer(this, prefix, debug_string_options);
   comment_printer.AddPreComment(contents);
 
@@ -2235,6 +2498,17 @@ void FieldDescriptor::DebugString(int depth,
     strings::SubstituteAndAppend(contents, " [default = $0",
                                  DefaultValueAsString(true));
   }
+  if (has_json_name_) {
+    if (!bracketed) {
+      bracketed = true;
+      contents->append("[");
+    } else {
+      contents->append(", ");
+    }
+    contents->append("json_name = \"");
+    contents->append(CEscape(json_name()));
+    contents->append("\"");
+  }
 
   string formatted_options;
   if (FormatBracketedOptions(depth, options(), &formatted_options)) {
@@ -2248,8 +2522,12 @@ void FieldDescriptor::DebugString(int depth,
   }
 
   if (type() == TYPE_GROUP) {
-    message_type()->DebugString(depth, contents, debug_string_options,
-                                /* include_opening_clause */ false);
+    if (debug_string_options.elide_group_body) {
+      contents->append(" { ... };\n");
+    } else {
+      message_type()->DebugString(depth, contents, debug_string_options,
+                                  /* include_opening_clause */ false);
+    }
   } else {
     contents->append(";\n");
   }
@@ -2274,16 +2552,23 @@ void OneofDescriptor::DebugString(int depth, string* contents,
                                   debug_string_options) const {
   string prefix(depth * 2, ' ');
   ++depth;
-  SourceLocationCommentPrinter<OneofDescriptor>
+  SourceLocationCommentPrinter
       comment_printer(this, prefix, debug_string_options);
   comment_printer.AddPreComment(contents);
   strings::SubstituteAndAppend(
-      contents, "$0 oneof $1 {\n", prefix, name());
-  for (int i = 0; i < field_count(); i++) {
-    field(i)->DebugString(depth, FieldDescriptor::OMIT_LABEL, contents,
-                          debug_string_options);
+      contents, "$0 oneof $1 {", prefix, name());
+
+  FormatLineOptions(depth, options(), contents);
+
+  if (debug_string_options.elide_oneof_body) {
+    contents->append(" ... }\n");
+  } else {
+    for (int i = 0; i < field_count(); i++) {
+      field(i)->DebugString(depth, FieldDescriptor::OMIT_LABEL, contents,
+                            debug_string_options);
+    }
+    strings::SubstituteAndAppend(contents, "$0}\n", prefix);
   }
-  strings::SubstituteAndAppend(contents, "$0}\n", prefix);
   comment_printer.AddPostComment(contents);
 }
 
@@ -2305,7 +2590,7 @@ void EnumDescriptor::DebugString(int depth, string *contents,
   string prefix(depth * 2, ' ');
   ++depth;
 
-  SourceLocationCommentPrinter<EnumDescriptor>
+  SourceLocationCommentPrinter
       comment_printer(this, prefix, debug_string_options);
   comment_printer.AddPreComment(contents);
 
@@ -2339,7 +2624,7 @@ void EnumValueDescriptor::DebugString(int depth, string *contents,
                                       debug_string_options) const {
   string prefix(depth * 2, ' ');
 
-  SourceLocationCommentPrinter<EnumValueDescriptor>
+  SourceLocationCommentPrinter
       comment_printer(this, prefix, debug_string_options);
   comment_printer.AddPreComment(contents);
 
@@ -2370,7 +2655,7 @@ string ServiceDescriptor::DebugStringWithOptions(
 void ServiceDescriptor::DebugString(string *contents,
                                     const DebugStringOptions&
                                     debug_string_options) const {
-  SourceLocationCommentPrinter<ServiceDescriptor>
+  SourceLocationCommentPrinter
       comment_printer(this, /* prefix */ "", debug_string_options);
   comment_printer.AddPreComment(contents);
 
@@ -2405,7 +2690,7 @@ void MethodDescriptor::DebugString(int depth, string *contents,
   string prefix(depth * 2, ' ');
   ++depth;
 
-  SourceLocationCommentPrinter<MethodDescriptor>
+  SourceLocationCommentPrinter
       comment_printer(this, prefix, debug_string_options);
   comment_printer.AddPreComment(contents);
 
@@ -2445,6 +2730,9 @@ bool FileDescriptor::GetSourceLocation(const vector<int>& path,
 
         out_location->leading_comments = loc->leading_comments();
         out_location->trailing_comments = loc->trailing_comments();
+        out_location->leading_detached_comments.assign(
+            loc->leading_detached_comments().begin(),
+            loc->leading_detached_comments().end());
         return true;
       }
     }
@@ -2458,7 +2746,12 @@ bool FileDescriptor::GetSourceLocation(SourceLocation* out_location) const {
 }
 
 bool FieldDescriptor::is_packed() const {
-  return is_packable() && (options_ != NULL) && options_->packed();
+  if (!is_packable()) return false;
+  if (file_->syntax() == FileDescriptor::SYNTAX_PROTO2) {
+    return (options_ != NULL) && options_->packed();
+  } else {
+    return options_ == NULL || !options_->has_packed() || options_->packed();
+  }
 }
 
 bool Descriptor::GetSourceLocation(SourceLocation* out_location) const {
@@ -2571,7 +2864,7 @@ void MethodDescriptor::GetLocationPath(vector<int>* output) const {
 namespace {
 
 // Represents an options message to interpret. Extension names in the option
-// name are respolved relative to name_scope. element_name and orig_opt are
+// name are resolved relative to name_scope. element_name and orig_opt are
 // used only for error reporting (since the parser records locations against
 // pointers in the original options, not the mutable copy). The Message must be
 // one of the Options messages in descriptor.proto.
@@ -2604,6 +2897,9 @@ class DescriptorBuilder {
 
  private:
   friend class OptionInterpreter;
+
+  // Non-recursive part of BuildFile functionality.
+  const FileDescriptor* BuildFileImpl(const FileDescriptorProto& proto);
 
   const DescriptorPool* pool_;
   DescriptorPool::Tables* tables_;  // for convenience
@@ -2797,9 +3093,14 @@ class DescriptorBuilder {
   void BuildExtensionRange(const DescriptorProto::ExtensionRange& proto,
                            const Descriptor* parent,
                            Descriptor::ExtensionRange* result);
+  void BuildReservedRange(const DescriptorProto::ReservedRange& proto,
+                           const Descriptor* parent,
+                           Descriptor::ReservedRange* result);
   void BuildOneof(const OneofDescriptorProto& proto,
                   Descriptor* parent,
                   OneofDescriptor* result);
+  void CheckEnumValueUniqueness(const EnumDescriptorProto& proto,
+                                const EnumDescriptor* result);
   void BuildEnum(const EnumDescriptorProto& proto,
                  const Descriptor* parent,
                  EnumDescriptor* result);
@@ -2813,7 +3114,8 @@ class DescriptorBuilder {
                    const ServiceDescriptor* parent,
                    MethodDescriptor* result);
 
-  void LogUnusedDependency(const FileDescriptor* result);
+  void LogUnusedDependency(const FileDescriptorProto& proto,
+                           const FileDescriptor* result);
 
   // Must be run only after building.
   //
@@ -3397,7 +3699,7 @@ FileDescriptor* DescriptorBuilder::NewPlaceholderFile(
   placeholder->package_ = &internal::GetEmptyString();
   placeholder->pool_ = pool_;
   placeholder->options_ = &FileOptions::default_instance();
-  placeholder->tables_ = &FileDescriptorTables::kEmpty;
+  placeholder->tables_ = &FileDescriptorTables::GetEmptyInstance();
   placeholder->source_code_info_ = &SourceCodeInfo::default_instance();
   placeholder->is_placeholder_ = true;
   placeholder->syntax_ = FileDescriptor::SYNTAX_PROTO2;
@@ -3607,6 +3909,14 @@ static bool ExistingFileMatchesProto(const FileDescriptor* existing_file,
                                      const FileDescriptorProto& proto) {
   FileDescriptorProto existing_proto;
   existing_file->CopyTo(&existing_proto);
+  // TODO(liujisi): Remove it when CopyTo supports copying syntax params when
+  // syntax="proto2".
+  if (existing_file->syntax() == FileDescriptor::SYNTAX_PROTO2 &&
+      proto.has_syntax()) {
+    existing_proto.set_syntax(
+        existing_file->SyntaxName(existing_file->syntax()));
+  }
+
   return existing_proto.SerializeAsString() == proto.SerializeAsString();
 }
 
@@ -3661,7 +3971,11 @@ const FileDescriptor* DescriptorBuilder::BuildFile(
     }
     tables_->pending_files_.pop_back();
   }
+  return BuildFileImpl(proto);
+}
 
+const FileDescriptor* DescriptorBuilder::BuildFileImpl(
+    const FileDescriptorProto& proto) {
   // Checkpoint the tables so that we can roll back if something goes wrong.
   tables_->AddCheckpoint();
 
@@ -3696,7 +4010,6 @@ const FileDescriptor* DescriptorBuilder::BuildFile(
     AddError(proto.name(), proto, DescriptorPool::ErrorCollector::OTHER,
              "Unrecognized syntax: " + proto.syntax());
   }
-
 
   result->name_ = tables_->AllocateString(proto.name());
   if (proto.has_package()) {
@@ -3851,7 +4164,7 @@ const FileDescriptor* DescriptorBuilder::BuildFile(
 
 
   if (!unused_dependency_.empty()) {
-    LogUnusedDependency(result);
+    LogUnusedDependency(proto, result);
   }
 
   if (had_errors_) {
@@ -3888,6 +4201,17 @@ void DescriptorBuilder::BuildMessage(const DescriptorProto& proto,
   BUILD_ARRAY(proto, result, enum_type      , BuildEnum          , result);
   BUILD_ARRAY(proto, result, extension_range, BuildExtensionRange, result);
   BUILD_ARRAY(proto, result, extension      , BuildExtension     , result);
+  BUILD_ARRAY(proto, result, reserved_range , BuildReservedRange , result);
+
+  // Copy reserved names.
+  int reserved_name_count = proto.reserved_name_size();
+  result->reserved_name_count_ = reserved_name_count;
+  result->reserved_names_ =
+      tables_->AllocateArray<const string*>(reserved_name_count);
+  for (int i = 0; i < reserved_name_count; ++i) {
+    result->reserved_names_[i] =
+        tables_->AllocateString(proto.reserved_name(i));
+  }
 
   // Copy options.
   if (!proto.has_options()) {
@@ -3899,7 +4223,34 @@ void DescriptorBuilder::BuildMessage(const DescriptorProto& proto,
   AddSymbol(result->full_name(), parent, result->name(),
             proto, Symbol(result));
 
-  // Check that no fields have numbers in extension ranges.
+  for (int i = 0; i < proto.reserved_range_size(); i++) {
+    const DescriptorProto_ReservedRange& range1 = proto.reserved_range(i);
+    for (int j = i + 1; j < proto.reserved_range_size(); j++) {
+      const DescriptorProto_ReservedRange& range2 = proto.reserved_range(j);
+      if (range1.end() > range2.start() && range2.end() > range1.start()) {
+        AddError(result->full_name(), proto.reserved_range(i),
+                 DescriptorPool::ErrorCollector::NUMBER,
+                 strings::Substitute("Reserved range $0 to $1 overlaps with "
+                                     "already-defined range $2 to $3.",
+                                     range2.start(), range2.end() - 1,
+                                     range1.start(), range1.end() - 1));
+      }
+    }
+  }
+
+  hash_set<string> reserved_name_set;
+  for (int i = 0; i < proto.reserved_name_size(); i++) {
+    const string& name = proto.reserved_name(i);
+    if (reserved_name_set.find(name) == reserved_name_set.end()) {
+      reserved_name_set.insert(name);
+    } else {
+      AddError(name, proto, DescriptorPool::ErrorCollector::NAME,
+               strings::Substitute(
+                 "Field name \"$0\" is reserved multiple times.",
+                 name));
+    }
+  }
+
   for (int i = 0; i < result->field_count(); i++) {
     const FieldDescriptor* field = result->field(i);
     for (int j = 0; j < result->extension_range_count(); j++) {
@@ -3913,11 +4264,39 @@ void DescriptorBuilder::BuildMessage(const DescriptorProto& proto,
                    field->name(), field->number()));
       }
     }
+    for (int j = 0; j < result->reserved_range_count(); j++) {
+      const Descriptor::ReservedRange* range = result->reserved_range(j);
+      if (range->start <= field->number() && field->number() < range->end) {
+        AddError(field->full_name(), proto.reserved_range(j),
+                 DescriptorPool::ErrorCollector::NUMBER,
+                 strings::Substitute(
+                   "Field \"$0\" uses reserved number $1.",
+                   field->name(), field->number()));
+      }
+    }
+    if (reserved_name_set.find(field->name()) != reserved_name_set.end()) {
+      AddError(field->full_name(), proto.field(i),
+               DescriptorPool::ErrorCollector::NAME,
+               strings::Substitute(
+                 "Field name \"$0\" is reserved.", field->name()));
+    }
   }
 
-  // Check that extension ranges don't overlap.
+  // Check that extension ranges don't overlap and don't include
+  // reserved field numbers.
   for (int i = 0; i < result->extension_range_count(); i++) {
     const Descriptor::ExtensionRange* range1 = result->extension_range(i);
+    for (int j = 0; j < result->reserved_range_count(); j++) {
+      const Descriptor::ReservedRange* range2 = result->reserved_range(j);
+      if (range1->end > range2->start && range2->end > range1->start) {
+        AddError(result->full_name(), proto.extension_range(j),
+                 DescriptorPool::ErrorCollector::NUMBER,
+                 strings::Substitute("Extension range $0 to $1 overlaps with "
+                                     "reserved range $2 to $3.",
+                                     range1->start, range1->end - 1,
+                                     range2->start, range2->end - 1));
+      }
+    }
     for (int j = i + 1; j < result->extension_range_count(); j++) {
       const Descriptor::ExtensionRange* range2 = result->extension_range(j);
       if (range1->end > range2->start && range2->end > range1->start) {
@@ -3931,6 +4310,7 @@ void DescriptorBuilder::BuildMessage(const DescriptorProto& proto,
     }
   }
 }
+
 
 void DescriptorBuilder::BuildFieldOrExtension(const FieldDescriptorProto& proto,
                                               const Descriptor* parent,
@@ -3967,6 +4347,14 @@ void DescriptorBuilder::BuildFieldOrExtension(const FieldDescriptorProto& proto,
   result->camelcase_name_ =
       tables_->AllocateString(ToCamelCase(proto.name(),
                                           /* lower_first = */ true));
+
+  if (proto.has_json_name()) {
+    result->has_json_name_ = true;
+    result->json_name_ = tables_->AllocateString(proto.json_name());
+  } else {
+    result->has_json_name_ = false;
+    result->json_name_ = tables_->AllocateString(ToJsonName(proto.name()));
+  }
 
   // Some compilers do not allow static_cast directly between two enum types,
   // so we must cast to int first.
@@ -4029,8 +4417,8 @@ void DescriptorBuilder::BuildFieldOrExtension(const FieldDescriptorProto& proto,
           } else if (proto.default_value() == "nan") {
             result->default_value_float_ = numeric_limits<float>::quiet_NaN();
           } else  {
-            result->default_value_float_ =
-              io::NoLocaleStrtod(proto.default_value().c_str(), &end_pos);
+            result->default_value_float_ = io::SafeDoubleToFloat(
+                io::NoLocaleStrtod(proto.default_value().c_str(), &end_pos));
           }
           break;
         case FieldDescriptor::CPPTYPE_DOUBLE:
@@ -4202,6 +4590,7 @@ void DescriptorBuilder::BuildFieldOrExtension(const FieldDescriptorProto& proto,
     AllocateOptions(proto.options(), result);
   }
 
+
   AddSymbol(result->full_name(), parent, result->name(),
             proto, Symbol(result));
 }
@@ -4230,6 +4619,19 @@ void DescriptorBuilder::BuildExtensionRange(
   }
 }
 
+void DescriptorBuilder::BuildReservedRange(
+    const DescriptorProto::ReservedRange& proto,
+    const Descriptor* parent,
+    Descriptor::ReservedRange* result) {
+  result->start = proto.start();
+  result->end = proto.end();
+  if (result->start <= 0) {
+    AddError(parent->full_name(), proto,
+             DescriptorPool::ErrorCollector::NUMBER,
+             "Reserved numbers must be positive integers.");
+  }
+}
+
 void DescriptorBuilder::BuildOneof(const OneofDescriptorProto& proto,
                                    Descriptor* parent,
                                    OneofDescriptor* result) {
@@ -4248,8 +4650,79 @@ void DescriptorBuilder::BuildOneof(const OneofDescriptorProto& proto,
   result->field_count_ = 0;
   result->fields_ = NULL;
 
+  // Copy options.
+  if (!proto.has_options()) {
+    result->options_ = NULL;  // Will set to default_instance later.
+  } else {
+    AllocateOptions(proto.options(), result);
+  }
+
   AddSymbol(result->full_name(), parent, result->name(),
             proto, Symbol(result));
+}
+
+void DescriptorBuilder::CheckEnumValueUniqueness(
+    const EnumDescriptorProto& proto, const EnumDescriptor* result) {
+
+  // Check that enum labels are still unique when we remove the enum prefix from
+  // values that have it.
+  //
+  // This will fail for something like:
+  //
+  //   enum MyEnum {
+  //     MY_ENUM_FOO = 0;
+  //     FOO = 1;
+  //   }
+  //
+  // By enforcing this reasonable constraint, we allow code generators to strip
+  // the prefix and/or PascalCase it without creating conflicts.  This can lead
+  // to much nicer language-specific enums like:
+  //
+  //   enum NameType {
+  //     FirstName = 1,
+  //     LastName = 2,
+  //   }
+  //
+  // Instead of:
+  //
+  //   enum NameType {
+  //     NAME_TYPE_FIRST_NAME = 1,
+  //     NAME_TYPE_LAST_NAME = 2,
+  //   }
+  PrefixRemover remover(result->name());
+  map<string, const google::protobuf::EnumValueDescriptor*> values;
+  for (int i = 0; i < result->value_count(); i++) {
+    const google::protobuf::EnumValueDescriptor* value = result->value(i);
+    string stripped =
+        EnumValueToPascalCase(remover.MaybeRemove(value->name()));
+    std::pair<map<string, const google::protobuf::EnumValueDescriptor*>::iterator, bool>
+        insert_result = values.insert(std::make_pair(stripped, value));
+    bool inserted = insert_result.second;
+
+    // We don't throw the error if the two conflicting symbols are identical, or
+    // if they map to the same number.  In the former case, the normal symbol
+    // duplication error will fire so we don't need to (and its error message
+    // will make more sense). We allow the latter case so users can create
+    // aliases which add or remove the prefix (code generators that do prefix
+    // stripping should de-dup the labels in this case).
+    if (!inserted && insert_result.first->second->name() != value->name() &&
+        insert_result.first->second->number() != value->number()) {
+      string error_message =
+          "When enum name is stripped and label is PascalCased (" + stripped +
+          "), this value label conflicts with " + values[stripped]->name() +
+          ". This will make the proto fail to compile for some languages, such "
+          "as C#.";
+      // There are proto2 enums out there with conflicting names, so to preserve
+      // compatibility we issue only a warning for proto2.
+      if (result->file()->syntax() == FileDescriptor::SYNTAX_PROTO2) {
+        AddWarning(value->full_name(), proto.value(i),
+                   DescriptorPool::ErrorCollector::NAME, error_message);
+      } else {
+        AddError(value->full_name(), proto.value(i),
+                 DescriptorPool::ErrorCollector::NAME, error_message);
+      }
+    }
+  }
 }
 
 void DescriptorBuilder::BuildEnum(const EnumDescriptorProto& proto,
@@ -4279,6 +4752,8 @@ void DescriptorBuilder::BuildEnum(const EnumDescriptorProto& proto,
   }
 
   BUILD_ARRAY(proto, result, value, BuildEnumValue, result);
+
+  CheckEnumValueUniqueness(proto, result);
 
   // Copy options.
   if (!proto.has_options()) {
@@ -4471,6 +4946,23 @@ void DescriptorBuilder::CrossLinkMessage(
   for (int i = 0; i < message->field_count(); i++) {
     const OneofDescriptor* oneof_decl = message->field(i)->containing_oneof();
     if (oneof_decl != NULL) {
+      // Make sure fields belonging to the same oneof are defined consecutively.
+      // This enables optimizations in codegens and reflection libraries to
+      // skip fields in the oneof group, as only one of the field can be set.
+      // Note that field_count() returns how many fields in this oneof we have
+      // seen so far. field_count() > 0 guarantees that i > 0, so field(i-1) is
+      // safe.
+      if (oneof_decl->field_count() > 0 &&
+          message->field(i - 1)->containing_oneof() != oneof_decl) {
+        AddError(
+            message->full_name() + "." + message->field(i - 1)->name(),
+            proto.field(i - 1), DescriptorPool::ErrorCollector::OTHER,
+            strings::Substitute(
+                "Fields in the same oneof must be defined consecutively. "
+                "\"$0\" cannot be defined before the completion of the "
+                "\"$1\" oneof definition.",
+                message->field(i - 1)->name(), oneof_decl->name()));
+      }
       // Must go through oneof_decls_ array to get a non-const version of the
       // OneofDescriptor.
       ++message->oneof_decls_[oneof_decl->index()].field_count_;
@@ -4491,6 +4983,10 @@ void DescriptorBuilder::CrossLinkMessage(
     oneof_decl->fields_ =
       tables_->AllocateArray<const FieldDescriptor*>(oneof_decl->field_count_);
     oneof_decl->field_count_ = 0;
+
+    if (oneof_decl->options_ == NULL) {
+      oneof_decl->options_ = &OneofOptions::default_instance();
+    }
   }
 
   // Then fill them in.
@@ -4835,11 +5331,20 @@ void DescriptorBuilder::ValidateProto3(
   for (int i = 0; i < file->enum_type_count(); ++i) {
     ValidateProto3Enum(file->enum_types_ + i, proto.enum_type(i));
   }
-  if (IsLite(file)) {
-    AddError(file->name(), proto,
-             DescriptorPool::ErrorCollector::OTHER,
-             "Lite runtime is not supported in proto3.");
+}
+
+static string ToLowercaseWithoutUnderscores(const string& name) {
+  string result;
+  for (int i = 0; i < name.size(); ++i) {
+    if (name[i] != '_') {
+      if (name[i] >= 'A' && name[i] <= 'Z') {
+        result.push_back(name[i] - 'A' + 'a');
+      } else {
+        result.push_back(name[i]);
+      }
+    }
   }
+  return result;
 }
 
 void DescriptorBuilder::ValidateProto3Message(
@@ -4868,6 +5373,25 @@ void DescriptorBuilder::ValidateProto3Message(
     AddError(message->full_name(), proto,
              DescriptorPool::ErrorCollector::OTHER,
              "MessageSet is not supported in proto3.");
+  }
+
+  // In proto3, we reject field names if they conflict in camelCase.
+  // Note that we currently enforce a stricter rule: Field names must be
+  // unique after being converted to lowercase with underscores removed.
+  map<string, const FieldDescriptor*> name_to_field;
+  for (int i = 0; i < message->field_count(); ++i) {
+    string lowercase_name = ToLowercaseWithoutUnderscores(
+        message->field(i)->name());
+    if (name_to_field.find(lowercase_name) != name_to_field.end()) {
+      AddError(message->full_name(), proto,
+               DescriptorPool::ErrorCollector::OTHER,
+               "The JSON camel-case name of field \"" +
+               message->field(i)->name() + "\" conflicts with field \"" +
+               name_to_field[lowercase_name]->name() + "\". This is not " +
+               "allowed in proto3.");
+    } else {
+      name_to_field[lowercase_name] = message->field(i);
+    }
   }
 }
 
@@ -4900,6 +5424,11 @@ void DescriptorBuilder::ValidateProto3Field(
              "\" is not a proto3 enum, but is used in \"" +
              field->containing_type()->full_name() +
              "\" which is a proto3 message type.");
+  }
+  if (field->type() == FieldDescriptor::TYPE_GROUP) {
+    AddError(field->full_name(), proto,
+             DescriptorPool::ErrorCollector::TYPE,
+             "Groups are not supported in proto3 syntax.");
   }
 }
 
@@ -5110,8 +5639,16 @@ bool DescriptorBuilder::ValidateMapEntry(FieldDescriptor* field,
     case FieldDescriptor::TYPE_SFIXED64:
       // Legal cases
       break;
-    // Do not add a default, so that the compiler will complian when new types
+    // Do not add a default, so that the compiler will complain when new types
     // are added.
+  }
+
+  if (value->type() == FieldDescriptor::TYPE_ENUM) {
+    if (value->enum_type()->value(0)->number() != 0) {
+      AddError(
+          field->full_name(), proto, DescriptorPool::ErrorCollector::TYPE,
+          "Enum value in map must define 0 as the first value.");
+    }
   }
 
   return true;
@@ -5123,7 +5660,7 @@ void DescriptorBuilder::DetectMapConflicts(const Descriptor* message,
   for (int i = 0; i < message->nested_type_count(); ++i) {
     const Descriptor* nested = message->nested_type(i);
     pair<map<string, const Descriptor*>::iterator, bool> result =
-        seen_types.insert(make_pair(nested->name(), nested));
+        seen_types.insert(std::make_pair(nested->name(), nested));
     if (!result.second) {
       if (result.first->second->options().map_entry() ||
           nested->options().map_entry()) {
@@ -5238,11 +5775,19 @@ bool DescriptorBuilder::OptionInterpreter::InterpretOptions(
     // UnknownFieldSet and wait there until the message is parsed by something
     // that does know about the options.
     string buf;
-    options->AppendToString(&buf);
-    GOOGLE_CHECK(options->ParseFromString(buf))
+    GOOGLE_CHECK(options->AppendPartialToString(&buf))
+        << "Protocol message could not be serialized.";
+    GOOGLE_CHECK(options->ParsePartialFromString(buf))
         << "Protocol message serialized itself in invalid fashion.";
+    if (!options->IsInitialized()) {
+      builder_->AddWarning(
+          options_to_interpret->element_name, *original_options,
+          DescriptorPool::ErrorCollector::OTHER,
+          "Options could not be fully parsed using the proto descriptors "
+          "compiled into this binary. Missing required fields: " +
+          options->InitializationErrorString());
+    }
   }
-
   return !failed;
 }
 
@@ -5391,7 +5936,7 @@ bool DescriptorBuilder::OptionInterpreter::InterpretSingleOption(
 
   // First set the value on the UnknownFieldSet corresponding to the
   // innermost message.
-  scoped_ptr<UnknownFieldSet> unknown_fields(new UnknownFieldSet());
+  google::protobuf::scoped_ptr<UnknownFieldSet> unknown_fields(new UnknownFieldSet());
   if (!SetOptionValue(field, unknown_fields.get())) {
     return false;  // SetOptionValue() already added the error.
   }
@@ -5401,7 +5946,8 @@ bool DescriptorBuilder::OptionInterpreter::InterpretSingleOption(
   for (vector<const FieldDescriptor*>::reverse_iterator iter =
            intermediate_fields.rbegin();
        iter != intermediate_fields.rend(); ++iter) {
-    scoped_ptr<UnknownFieldSet> parent_unknown_fields(new UnknownFieldSet());
+    google::protobuf::scoped_ptr<UnknownFieldSet> parent_unknown_fields(
+        new UnknownFieldSet());
     switch ((*iter)->type()) {
       case FieldDescriptor::TYPE_MESSAGE: {
         io::StringOutputStream outstr(
@@ -5787,7 +6333,7 @@ bool DescriptorBuilder::OptionInterpreter::SetAggregateOption(
   }
 
   const Descriptor* type = option_field->message_type();
-  scoped_ptr<Message> dynamic(dynamic_factory_.GetPrototype(type)->New());
+  google::protobuf::scoped_ptr<Message> dynamic(dynamic_factory_.GetPrototype(type)->New());
   GOOGLE_CHECK(dynamic.get() != NULL)
       << "Could not create an instance of " << option_field->DebugString();
 
@@ -5895,7 +6441,8 @@ void DescriptorBuilder::OptionInterpreter::SetUInt64(int number, uint64 value,
   }
 }
 
-void DescriptorBuilder::LogUnusedDependency(const FileDescriptor* result) {
+void DescriptorBuilder::LogUnusedDependency(const FileDescriptorProto& proto,
+                                            const FileDescriptor* result) {
 
   if (!unused_dependency_.empty()) {
     std::set<string> annotation_extensions;
@@ -5921,9 +6468,9 @@ void DescriptorBuilder::LogUnusedDependency(const FileDescriptor* result) {
       }
       // Log warnings for unused imported files.
       if (i == (*it)->extension_count()) {
-        GOOGLE_LOG(WARNING) << "Warning: Unused import: \"" << result->name()
-                     << "\" imports \"" << (*it)->name()
-                     << "\" which is not used.";
+        string error_message = "Import " + (*it)->name() + " but not used.";
+        AddWarning((*it)->name(), proto, DescriptorPool::ErrorCollector::OTHER,
+                   error_message);
       }
     }
   }

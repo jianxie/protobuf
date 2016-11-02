@@ -44,6 +44,7 @@
 // performance-minded Python code leverage the fast C++ implementation
 // directly.
 
+#include <algorithm>
 #include <google/protobuf/stubs/hash.h>
 #include <limits>
 #include <map>
@@ -58,6 +59,7 @@
 #include <google/protobuf/compiler/python/python_generator.h>
 #include <google/protobuf/descriptor.pb.h>
 
+#include <google/protobuf/stubs/logging.h>
 #include <google/protobuf/stubs/common.h>
 #include <google/protobuf/stubs/stringprintf.h>
 #include <google/protobuf/io/printer.h>
@@ -86,8 +88,8 @@ string StripProto(const string& filename) {
 // Returns the Python module name expected for a given .proto filename.
 string ModuleName(const string& filename) {
   string basename = StripProto(filename);
-  StripString(&basename, "-", '_');
-  StripString(&basename, "/", '.');
+  ReplaceCharacters(&basename, "-", '_');
+  ReplaceCharacters(&basename, "/", '.');
   return basename + "_pb2";
 }
 
@@ -106,20 +108,25 @@ string ModuleAlias(const string& filename) {
   return module_name;
 }
 
+// Keywords reserved by the Python language.
+const char* const kKeywords[] = {
+    "False",   "None",     "True",     "and",    "as",    "assert", "break",
+    "class",   "continue", "def",      "del",    "elif",  "else",   "except",
+    "finally", "for",      "from",     "global", "if",    "import", "in",
+    "is",      "lambda",   "nonlocal", "not",    "or",    "pass",   "raise",
+    "return",  "try",      "while",    "with",   "yield",
+};
+const char* const* kKeywordsEnd =
+    kKeywords + (sizeof(kKeywords) / sizeof(kKeywords[0]));
 
-// Returns an import statement of form "from X.Y.Z import T" for the given
-// .proto filename.
-string ModuleImportStatement(const string& filename) {
-  string module_name = ModuleName(filename);
-  int last_dot_pos = module_name.rfind('.');
-  if (last_dot_pos == string::npos) {
-    // NOTE(petya): this is not tested as it would require a protocol buffer
-    // outside of any package, and I don't think that is easily achievable.
-    return "import " + module_name;
-  } else {
-    return "from " + module_name.substr(0, last_dot_pos) + " import " +
-        module_name.substr(last_dot_pos + 1);
+bool ContainsPythonKeyword(const string& module_name) {
+  vector<string> tokens = Split(module_name, ".");
+  for (int i = 0; i < tokens.size(); ++i) {
+    if (std::find(kKeywords, kKeywordsEnd, tokens[i]) != kKeywordsEnd) {
+      return true;
+    }
   }
+  return false;
 }
 
 
@@ -234,7 +241,7 @@ string StringifyDefaultValue(const FieldDescriptor& field) {
         // infinity * 0 = nan
         return "(1e10000 * 0)";
       } else {
-        return SimpleDtoa(value);
+        return "float(" + SimpleDtoa(value) + ")";
       }
     }
     case FieldDescriptor::CPPTYPE_FLOAT: {
@@ -250,7 +257,7 @@ string StringifyDefaultValue(const FieldDescriptor& field) {
         // infinity - infinity = nan
         return "(1e10000 * 0)";
       } else {
-        return SimpleFtoa(value);
+        return "float(" + SimpleFtoa(value) + ")";
       }
     }
     case FieldDescriptor::CPPTYPE_BOOL:
@@ -273,6 +280,19 @@ string StringifyDefaultValue(const FieldDescriptor& field) {
   return "";
 }
 
+string StringifySyntax(FileDescriptor::Syntax syntax) {
+  switch (syntax) {
+    case FileDescriptor::SYNTAX_PROTO2:
+      return "proto2";
+    case FileDescriptor::SYNTAX_PROTO3:
+      return "proto3";
+    case FileDescriptor::SYNTAX_UNKNOWN:
+    default:
+      GOOGLE_LOG(FATAL) << "Unsupported syntax; this generator only supports proto2 "
+                    "and proto3 syntax.";
+      return "";
+  }
+}
 
 
 }  // namespace
@@ -300,7 +320,7 @@ bool Generator::Generate(const FileDescriptor* file,
   file_ = file;
   string module_name = ModuleName(file->name());
   string filename = module_name;
-  StripString(&filename, ".", '/');
+  ReplaceCharacters(&filename, ".", '/');
   filename += ".py";
 
   FileDescriptorProto fdp;
@@ -345,10 +365,32 @@ bool Generator::Generate(const FileDescriptor* file,
 void Generator::PrintImports() const {
   for (int i = 0; i < file_->dependency_count(); ++i) {
     const string& filename = file_->dependency(i)->name();
-    string import_statement = ModuleImportStatement(filename);
+
+    string module_name = ModuleName(filename);
     string module_alias = ModuleAlias(filename);
-    printer_->Print("$statement$ as $alias$\n", "statement",
-                    import_statement, "alias", module_alias);
+    if (ContainsPythonKeyword(module_name)) {
+      // If the module path contains a Python keyword, we have to quote the
+      // module name and import it using importlib. Otherwise the usual kind of
+      // import statement would result in a syntax error from the presence of
+      // the keyword.
+      printer_->Print("import importlib\n");
+      printer_->Print("$alias$ = importlib.import_module('$name$')\n", "alias",
+                      module_alias, "name", module_name);
+    } else {
+      int last_dot_pos = module_name.rfind('.');
+      string import_statement;
+      if (last_dot_pos == string::npos) {
+        // NOTE(petya): this is not tested as it would require a protocol buffer
+        // outside of any package, and I don't think that is easily achievable.
+        import_statement = "import " + module_name;
+      } else {
+        import_statement = "from " + module_name.substr(0, last_dot_pos) +
+                           " import " + module_name.substr(last_dot_pos + 1);
+      }
+      printer_->Print("$statement$ as $alias$\n", "statement", import_statement,
+                      "alias", module_alias);
+    }
+
     CopyPublicDependenciesAliases(module_alias, file_->dependency(i));
   }
   printer_->Print("\n");
@@ -367,10 +409,12 @@ void Generator::PrintFileDescriptor() const {
   m["descriptor_name"] = kDescriptorKey;
   m["name"] = file_->name();
   m["package"] = file_->package();
+  m["syntax"] = StringifySyntax(file_->syntax());
   const char file_descriptor_template[] =
       "$descriptor_name$ = _descriptor.FileDescriptor(\n"
       "  name='$name$',\n"
-      "  package='$package$',\n";
+      "  package='$package$',\n"
+      "  syntax='$syntax$',\n";
   printer_->Print(m, file_descriptor_template);
   printer_->Indent();
   printer_->Print(
@@ -381,6 +425,15 @@ void Generator::PrintFileDescriptor() const {
     printer_->Print(",\ndependencies=[");
     for (int i = 0; i < file_->dependency_count(); ++i) {
       string module_alias = ModuleAlias(file_->dependency(i)->name());
+      printer_->Print("$module_alias$.DESCRIPTOR,", "module_alias",
+                      module_alias);
+    }
+    printer_->Print("]");
+  }
+  if (file_->public_dependency_count() > 0) {
+    printer_->Print(",\npublic_dependencies=[");
+    for (int i = 0; i < file_->public_dependency_count(); ++i) {
+      string module_alias = ModuleAlias(file_->public_dependency(i)->name());
       printer_->Print("$module_alias$.DESCRIPTOR,", "module_alias",
                       module_alias);
     }
@@ -414,7 +467,7 @@ void Generator::PrintTopLevelEnums() const {
     for (int j = 0; j < enum_descriptor.value_count(); ++j) {
       const EnumValueDescriptor& value_descriptor = *enum_descriptor.value(j);
       top_level_enum_values.push_back(
-          make_pair(value_descriptor.name(), value_descriptor.number()));
+          std::make_pair(value_descriptor.name(), value_descriptor.number()));
     }
   }
 
@@ -581,14 +634,15 @@ void Generator::PrintServiceDescriptor(
 }
 
 
-void Generator::PrintDescriptorKeyAndModuleName(const ServiceDescriptor& descriptor) const {	  
+void Generator::PrintDescriptorKeyAndModuleName(
+    const ServiceDescriptor& descriptor) const {
   printer_->Print(
       "$descriptor_key$ = $descriptor_name$,\n",
       "descriptor_key", kDescriptorKey,
       "descriptor_name", ModuleLevelServiceDescriptorName(descriptor));
   printer_->Print(
       "__module__ = '$module_name$'\n",
-      "module_name", ModuleName(file_->name())); 
+      "module_name", ModuleName(file_->name()));
 }
 
 void Generator::PrintServiceClass(const ServiceDescriptor& descriptor) const {
@@ -664,10 +718,12 @@ void Generator::PrintDescriptor(const Descriptor& message_descriptor) const {
   message_descriptor.options().SerializeToString(&options_string);
   printer_->Print(
       "options=$options_value$,\n"
-      "is_extendable=$extendable$",
+      "is_extendable=$extendable$,\n"
+      "syntax='$syntax$'",
       "options_value", OptionsValue("MessageOptions", options_string),
       "extendable", message_descriptor.extension_range_count() > 0 ?
-                      "True" : "False");
+                      "True" : "False",
+      "syntax", StringifySyntax(message_descriptor.file()->syntax()));
   printer_->Print(",\n");
 
   // Extension ranges
@@ -688,11 +744,18 @@ void Generator::PrintDescriptor(const Descriptor& message_descriptor) const {
     m["name"] = desc->name();
     m["full_name"] = desc->full_name();
     m["index"] = SimpleItoa(desc->index());
+    string options_string =
+        OptionsValue("OneofOptions", desc->options().SerializeAsString());
+    if (options_string == "None") {
+      m["options"] = "";
+    } else {
+      m["options"] = ", options=" + options_string;
+    }
     printer_->Print(
         m,
         "_descriptor.OneofDescriptor(\n"
         "  name='$name$', full_name='$full_name$',\n"
-        "  index=$index$, containing_type=None, fields=[]),\n");
+        "  index=$index$, containing_type=None, fields=[]$options$),\n");
   }
   printer_->Outdent();
   printer_->Print("],\n");
@@ -1040,6 +1103,8 @@ void Generator::PrintFieldDescriptor(
   m["default_value"] = StringifyDefaultValue(field);
   m["is_extension"] = is_extension ? "True" : "False";
   m["options"] = OptionsValue("FieldOptions", options_string);
+  m["json_name"] = field.has_json_name() ?
+      ", json_name='" + field.json_name() + "'": "";
   // We always set message_type and enum_type to None at this point, and then
   // these fields in correctly after all referenced descriptors have been
   // defined and/or imported (see FixForeignFieldsInDescriptors()).
@@ -1050,7 +1115,7 @@ void Generator::PrintFieldDescriptor(
     "  has_default_value=$has_default_value$, default_value=$default_value$,\n"
     "  message_type=None, enum_type=None, containing_type=None,\n"
     "  is_extension=$is_extension$, extension_scope=None,\n"
-    "  options=$options$)";
+    "  options=$options$$json_name$)";
   printer_->Print(m, field_descriptor_decl);
 }
 
@@ -1216,6 +1281,18 @@ void Generator::FixAllDescriptorOptions() const {
   }
 }
 
+void Generator::FixOptionsForOneof(const OneofDescriptor& oneof) const {
+  string oneof_options = OptionsValue(
+      "OneofOptions", oneof.options().SerializeAsString());
+  if (oneof_options != "None") {
+    string oneof_name = strings::Substitute(
+        "$0.$1['$2']",
+        ModuleLevelDescriptorName(*oneof.containing_type()),
+        "oneofs_by_name", oneof.name());
+    PrintDescriptorOptionsFixingCode(oneof_name, oneof_options, printer_);
+  }
+}
+
 // Prints expressions that set the options for an enum descriptor and its
 // value descriptors.
 void Generator::FixOptionsForEnum(const EnumDescriptor& enum_descriptor) const {
@@ -1268,6 +1345,10 @@ void Generator::FixOptionsForMessage(const Descriptor& descriptor) const {
   // Nested messages.
   for (int i = 0; i < descriptor.nested_type_count(); ++i) {
     FixOptionsForMessage(*descriptor.nested_type(i));
+  }
+  // Oneofs.
+  for (int i = 0; i < descriptor.oneof_decl_count(); ++i) {
+    FixOptionsForOneof(*descriptor.oneof_decl(i));
   }
   // Enums.
   for (int i = 0; i < descriptor.enum_type_count(); ++i) {

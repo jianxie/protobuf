@@ -34,10 +34,12 @@
 
 #include <google/protobuf/unknown_field_set.h>
 
+#include <google/protobuf/stubs/logging.h>
 #include <google/protobuf/stubs/common.h>
 #include <google/protobuf/io/coded_stream.h>
 #include <google/protobuf/io/zero_copy_stream.h>
 #include <google/protobuf/io/zero_copy_stream_impl.h>
+#include <google/protobuf/metadata.h>
 #include <google/protobuf/wire_format.h>
 #include <google/protobuf/stubs/stl_util.h>
 
@@ -50,8 +52,13 @@ namespace {
 // instantiate the UnknownFieldSet dynamically only when required.
 UnknownFieldSet* default_unknown_field_set_instance_ = NULL;
 
+void DeleteDefaultUnknownFieldSet() {
+  delete default_unknown_field_set_instance_;
+}
+
 void InitDefaultUnknownFieldSet() {
   default_unknown_field_set_instance_ = new UnknownFieldSet();
+  internal::OnShutdown(&DeleteDefaultUnknownFieldSet);
 }
 
 GOOGLE_PROTOBUF_DECLARE_ONCE(default_unknown_field_set_once_init_);
@@ -63,28 +70,14 @@ const UnknownFieldSet* UnknownFieldSet::default_instance() {
   return default_unknown_field_set_instance_;
 }
 
-UnknownFieldSet::UnknownFieldSet()
-    : fields_(NULL) {}
-
-UnknownFieldSet::~UnknownFieldSet() {
-  Clear();
-  delete fields_;
-}
-
 void UnknownFieldSet::ClearFallback() {
-  if (fields_ != NULL) {
-    for (int i = 0; i < fields_->size(); i++) {
-      (*fields_)[i].Delete();
-    }
-    delete fields_;
-    fields_ = NULL;
-  }
-}
-
-void UnknownFieldSet::ClearAndFreeMemory() {
-  if (fields_ != NULL) {
-    Clear();
-  }
+  GOOGLE_DCHECK(fields_ != NULL && fields_->size() > 0);
+  int n = fields_->size();
+  do {
+    (*fields_)[--n].Delete();
+  } while (n > 0);
+  delete fields_;
+  fields_ = NULL;
 }
 
 void UnknownFieldSet::InternalMergeFrom(const UnknownFieldSet& other) {
@@ -93,7 +86,7 @@ void UnknownFieldSet::InternalMergeFrom(const UnknownFieldSet& other) {
     fields_ = new vector<UnknownField>();
     for (int i = 0; i < other_field_count; i++) {
       fields_->push_back((*other.fields_)[i]);
-      fields_->back().DeepCopy();
+      fields_->back().DeepCopy((*other.fields_)[i]);
     }
   }
 }
@@ -104,7 +97,7 @@ void UnknownFieldSet::MergeFrom(const UnknownFieldSet& other) {
     if (fields_ == NULL) fields_ = new vector<UnknownField>();
     for (int i = 0; i < other_field_count; i++) {
       fields_->push_back((*other.fields_)[i]);
-      fields_->back().DeepCopy();
+      fields_->back().DeepCopy((*other.fields_)[i]);
     }
   }
 }
@@ -122,6 +115,12 @@ void UnknownFieldSet::MergeFromAndDestroy(UnknownFieldSet* other) {
   }
   delete other->fields_;
   other->fields_ = NULL;
+}
+
+void UnknownFieldSet::MergeToInternalMetdata(
+    const UnknownFieldSet& other,
+    internal::InternalMetadataWithArena* metadata) {
+  metadata->mutable_unknown_fields()->MergeFrom(other);
 }
 
 int UnknownFieldSet::SpaceUsedExcludingSelf() const {
@@ -202,7 +201,7 @@ UnknownFieldSet* UnknownFieldSet::AddGroup(int number) {
 void UnknownFieldSet::AddField(const UnknownField& field) {
   if (fields_ == NULL) fields_ = new vector<UnknownField>();
   fields_->push_back(field);
-  fields_->back().DeepCopy();
+  fields_->back().DeepCopy(field);
 }
 
 void UnknownFieldSet::DeleteSubrange(int start, int num) {
@@ -303,7 +302,7 @@ void UnknownField::Reset() {
   }
 }
 
-void UnknownField::DeepCopy() {
+void UnknownField::DeepCopy(const UnknownField& other) {
   switch (type()) {
     case UnknownField::TYPE_LENGTH_DELIMITED:
       length_delimited_.string_value_ = new string(

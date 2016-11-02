@@ -42,6 +42,7 @@
 
 #include <google/protobuf/repeated_field.h>
 
+#include <google/protobuf/stubs/logging.h>
 #include <google/protobuf/stubs/common.h>
 #include <google/protobuf/unittest.pb.h>
 #include <google/protobuf/stubs/strutil.h>
@@ -94,7 +95,7 @@ TEST(RepeatedField, Small) {
   EXPECT_EQ(field.size(), 0);
   // Additional bytes are for 'struct Rep' header.
   int expected_usage = 4 * sizeof(int) + sizeof(Arena*);
-  EXPECT_EQ(field.SpaceUsedExcludingSelf(), expected_usage);
+  EXPECT_GE(field.SpaceUsedExcludingSelf(), expected_usage);
 }
 
 
@@ -206,7 +207,7 @@ TEST(RepeatedField, ReserveMoreThanDouble) {
   RepeatedField<int> field;
   field.Reserve(20);
 
-  EXPECT_EQ(20, ReservedSpace(&field));
+  EXPECT_LE(20, ReservedSpace(&field));
 }
 
 TEST(RepeatedField, ReserveLessThanDouble) {
@@ -214,9 +215,10 @@ TEST(RepeatedField, ReserveLessThanDouble) {
   // field to grow by double instead.
   RepeatedField<int> field;
   field.Reserve(20);
-  field.Reserve(30);
+  int capacity = field.Capacity();
+  field.Reserve(capacity * 1.5);
 
-  EXPECT_EQ(40, ReservedSpace(&field));
+  EXPECT_LE(2 * capacity, ReservedSpace(&field));
 }
 
 TEST(RepeatedField, ReserveLessThanExisting) {
@@ -228,7 +230,7 @@ TEST(RepeatedField, ReserveLessThanExisting) {
   field.Reserve(10);
 
   EXPECT_EQ(previous_ptr, field.data());
-  EXPECT_EQ(20, ReservedSpace(&field));
+  EXPECT_LE(20, ReservedSpace(&field));
 }
 
 TEST(RepeatedField, Resize) {
@@ -396,6 +398,16 @@ TEST(RepeatedField, MutableDataIsMutable) {
   EXPECT_EQ(2, field.Get(0));
 }
 
+TEST(RepeatedField, SubscriptOperators) {
+  RepeatedField<int> field;
+  field.Add(1);
+  EXPECT_EQ(1, field.Get(0));
+  EXPECT_EQ(1, field[0]);
+  EXPECT_EQ(field.Mutable(0), &field[0]);
+  const RepeatedField<int>& const_field = field;
+  EXPECT_EQ(field.data(), &const_field[0]);
+}
+
 TEST(RepeatedField, Truncate) {
   RepeatedField<int> field;
 
@@ -454,6 +466,28 @@ TEST(RepeatedField, ExtractSubrange) {
       }
     }
   }
+}
+
+TEST(RepeatedField, ClearThenReserveMore) {
+  // Test that Reserve properly destroys the old internal array when it's forced
+  // to allocate a new one, even when cleared-but-not-deleted objects are
+  // present. Use a 'string' and > 16 bytes length so that the elements are
+  // non-POD and allocate -- the leak checker will catch any skipped destructor
+  // calls here.
+  RepeatedField<string> field;
+  for (int i = 0; i < 32; i++) {
+    field.Add(string("abcdefghijklmnopqrstuvwxyz0123456789"));
+  }
+  EXPECT_EQ(32, field.size());
+  field.Clear();
+  EXPECT_EQ(0, field.size());
+  EXPECT_LE(32, field.Capacity());
+
+  field.Reserve(1024);
+  EXPECT_EQ(0, field.size());
+  EXPECT_LE(1024, field.Capacity());
+  // Finish test -- |field| should destroy the cleared-but-not-yet-destroyed
+  // strings.
 }
 
 // ===================================================================
@@ -606,15 +640,18 @@ TEST(RepeatedPtrField, ReserveMoreThanDouble) {
   RepeatedPtrField<string> field;
   field.Reserve(20);
 
-  EXPECT_EQ(20, ReservedSpace(&field));
+  EXPECT_LE(20, ReservedSpace(&field));
 }
 
 TEST(RepeatedPtrField, ReserveLessThanDouble) {
   RepeatedPtrField<string> field;
   field.Reserve(20);
-  field.Reserve(30);
 
-  EXPECT_EQ(40, ReservedSpace(&field));
+  int capacity = field.Capacity();
+  // Grow by 1.5x
+  field.Reserve(capacity + (capacity >> 2));
+
+  EXPECT_LE(2 * capacity, ReservedSpace(&field));
 }
 
 TEST(RepeatedPtrField, ReserveLessThanExisting) {
@@ -624,7 +661,7 @@ TEST(RepeatedPtrField, ReserveLessThanExisting) {
   field.Reserve(10);
 
   EXPECT_EQ(previous_ptr, field.data());
-  EXPECT_EQ(20, ReservedSpace(&field));
+  EXPECT_LE(20, ReservedSpace(&field));
 }
 
 TEST(RepeatedPtrField, ReserveDoesntLoseAllocated) {
@@ -895,6 +932,16 @@ TEST(RepeatedPtrField, MutableDataIsMutable) {
   EXPECT_EQ("2", field.Get(0));
 }
 
+TEST(RepeatedPtrField, SubscriptOperators) {
+  RepeatedPtrField<string> field;
+  *field.Add() = "1";
+  EXPECT_EQ("1", field.Get(0));
+  EXPECT_EQ("1", field[0]);
+  EXPECT_EQ(field.Mutable(0), &field[0]);
+  const RepeatedPtrField<string>& const_field = field;
+  EXPECT_EQ(*field.data(), &const_field[0]);
+}
+
 TEST(RepeatedPtrField, ExtractSubrange) {
   // Exhaustively test every subrange in arrays of all sizes from 0 through 9
   // with 0 through 3 cleared elements at the end.
@@ -1131,7 +1178,7 @@ TEST_F(RepeatedPtrFieldIteratorTest, STLAlgorithms_lower_bound) {
 
   string v = "f";
   RepeatedPtrField<string>::const_iterator it =
-      lower_bound(proto_array_.begin(), proto_array_.end(), v);
+      std::lower_bound(proto_array_.begin(), proto_array_.end(), v);
 
   EXPECT_EQ(*it, "n");
   EXPECT_TRUE(it == proto_array_.begin() + 3);
@@ -1292,8 +1339,8 @@ TEST_F(RepeatedPtrFieldPtrsIteratorTest, PtrSTLAlgorithms_lower_bound) {
   {
     string v = "f";
     RepeatedPtrField<string>::pointer_iterator it =
-        lower_bound(proto_array_.pointer_begin(), proto_array_.pointer_end(),
-                    &v, StringLessThan());
+        std::lower_bound(proto_array_.pointer_begin(),
+                         proto_array_.pointer_end(), &v, StringLessThan());
 
     GOOGLE_CHECK(*it != NULL);
 
@@ -1302,10 +1349,9 @@ TEST_F(RepeatedPtrFieldPtrsIteratorTest, PtrSTLAlgorithms_lower_bound) {
   }
   {
     string v = "f";
-    RepeatedPtrField<string>::const_pointer_iterator it =
-        lower_bound(const_proto_array_->pointer_begin(),
-                    const_proto_array_->pointer_end(),
-                    &v, StringLessThan());
+    RepeatedPtrField<string>::const_pointer_iterator it = std::lower_bound(
+        const_proto_array_->pointer_begin(), const_proto_array_->pointer_end(),
+        &v, StringLessThan());
 
     GOOGLE_CHECK(*it != NULL);
 
@@ -1343,9 +1389,8 @@ TEST_F(RepeatedPtrFieldPtrsIteratorTest, Sort) {
   EXPECT_EQ("foo", proto_array_.Get(0));
   EXPECT_EQ("n", proto_array_.Get(5));
   EXPECT_EQ("x", proto_array_.Get(9));
-  sort(proto_array_.pointer_begin(),
-       proto_array_.pointer_end(),
-       StringLessThan());
+  std::sort(proto_array_.pointer_begin(), proto_array_.pointer_end(),
+            StringLessThan());
   EXPECT_EQ("a", proto_array_.Get(0));
   EXPECT_EQ("baz", proto_array_.Get(2));
   EXPECT_EQ("y", proto_array_.Get(9));
@@ -1409,7 +1454,6 @@ class RepeatedFieldInsertionIteratorsTest : public testing::Test {
     std::copy(nested_ptrs.begin(), nested_ptrs.end(),
               RepeatedFieldBackInserter(
                   protobuffer.mutable_repeated_nested_message()));
-
   }
 
   virtual void TearDown() {
@@ -1478,9 +1522,9 @@ TEST_F(RepeatedFieldInsertionIteratorsTest,
     new_data->set_bb(i);
   }
   TestAllTypes testproto;
-  copy(data.begin(), data.end(),
-       AllocatedRepeatedPtrFieldBackInserter(
-           testproto.mutable_repeated_nested_message()));
+  std::copy(data.begin(), data.end(),
+            AllocatedRepeatedPtrFieldBackInserter(
+                testproto.mutable_repeated_nested_message()));
   EXPECT_EQ(testproto.DebugString(), goldenproto.DebugString());
 }
 
@@ -1497,9 +1541,46 @@ TEST_F(RepeatedFieldInsertionIteratorsTest,
     *new_data = "name-" + SimpleItoa(i);
   }
   TestAllTypes testproto;
-  copy(data.begin(), data.end(),
-       AllocatedRepeatedPtrFieldBackInserter(
-           testproto.mutable_repeated_string()));
+  std::copy(data.begin(), data.end(), AllocatedRepeatedPtrFieldBackInserter(
+                                          testproto.mutable_repeated_string()));
+  EXPECT_EQ(testproto.DebugString(), goldenproto.DebugString());
+}
+
+TEST_F(RepeatedFieldInsertionIteratorsTest,
+       UnsafeArenaAllocatedRepeatedPtrFieldWithStringIntData) {
+  vector<Nested*> data;
+  TestAllTypes goldenproto;
+  for (int i = 0; i < 10; ++i) {
+    Nested* new_data = new Nested;
+    new_data->set_bb(i);
+    data.push_back(new_data);
+
+    new_data = goldenproto.add_repeated_nested_message();
+    new_data->set_bb(i);
+  }
+  TestAllTypes testproto;
+  std::copy(data.begin(), data.end(),
+            UnsafeArenaAllocatedRepeatedPtrFieldBackInserter(
+                testproto.mutable_repeated_nested_message()));
+  EXPECT_EQ(testproto.DebugString(), goldenproto.DebugString());
+}
+
+TEST_F(RepeatedFieldInsertionIteratorsTest,
+       UnsafeArenaAllocatedRepeatedPtrFieldWithString) {
+  vector<string*> data;
+  TestAllTypes goldenproto;
+  for (int i = 0; i < 10; ++i) {
+    string* new_data = new string;
+    *new_data = "name-" + SimpleItoa(i);
+    data.push_back(new_data);
+
+    new_data = goldenproto.add_repeated_string();
+    *new_data = "name-" + SimpleItoa(i);
+  }
+  TestAllTypes testproto;
+  std::copy(data.begin(), data.end(),
+            UnsafeArenaAllocatedRepeatedPtrFieldBackInserter(
+                testproto.mutable_repeated_string()));
   EXPECT_EQ(testproto.DebugString(), goldenproto.DebugString());
 }
 

@@ -43,14 +43,14 @@ namespace cpp {
 
 class MapFieldGenerator : public FieldGenerator {
  public:
-  explicit MapFieldGenerator(const FieldDescriptor* descriptor,
-                             const Options& options);
+  MapFieldGenerator(const FieldDescriptor* descriptor, const Options& options);
   ~MapFieldGenerator();
 
   // implements FieldGenerator ---------------------------------------
   void GeneratePrivateMembers(io::Printer* printer) const;
   void GenerateAccessorDeclarations(io::Printer* printer) const;
-  void GenerateInlineAccessorDefinitions(io::Printer* printer) const;
+  void GenerateInlineAccessorDefinitions(io::Printer* printer,
+                                         bool is_inline) const;
   void GenerateClearingCode(io::Printer* printer) const;
   void GenerateMergingCode(io::Printer* printer) const;
   void GenerateSwappingCode(io::Printer* printer) const;
@@ -61,7 +61,12 @@ class MapFieldGenerator : public FieldGenerator {
   void GenerateByteSize(io::Printer* printer) const;
 
  private:
+  // A helper for GenerateSerializeWithCachedSizes{,ToArray}.
+  void GenerateSerializeWithCachedSizes(
+      io::Printer* printer, const map<string, string>& variables) const;
+
   const FieldDescriptor* descriptor_;
+  const bool dependent_field_;
   map<string, string> variables_;
 
   GOOGLE_DISALLOW_EVIL_CONSTRUCTORS(MapFieldGenerator);
